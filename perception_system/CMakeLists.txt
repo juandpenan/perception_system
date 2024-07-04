@@ -26,6 +26,8 @@ find_package(geometry_msgs REQUIRED)
 find_package(perception_system_interfaces REQUIRED)
 find_package(tf2_eigen REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(leg_tracker_ros2 REQUIRED)
+find_package(state_observers REQUIRED)
 
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
@@ -65,6 +67,8 @@ set(dependencies
   geometry_msgs
   tf2_geometry_msgs
   perception_system_interfaces
+  leg_tracker_ros2
+  state_observers
 )
 
 # OpenCV and PCL node

@@ -24,13 +24,25 @@ limitations under the License.
 
 #include "perception_system_interfaces/msg/detection.hpp"
 #include "perception_system_interfaces/msg/detection_array.hpp"
+#include "leg_tracker_ros2/msg/leg_array.hpp"
+#include "geometry_msgs/msg/point_stamped.hpp"
 
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/transform_broadcaster.h>
 
+#include <message_filters/subscriber.h>
+#include <message_filters/sync_policies/approximate_time.h>
+
+#include "state_observers/kalman_filter.hpp"
+
+
 namespace perception_system
 {
+
+using ApproximateSyncPolicy = message_filters::sync_policies::ApproximateTime<
+  perception_system_interfaces::msg::DetectionArray,
+  leg_tracker_ros2::msg::LegArray>;
 
 struct PerceptionData
 {
@@ -43,6 +55,67 @@ struct PerceptionInterest
 {
   bool status;
   rclcpp::Time time;
+};
+
+struct HumanTracked
+{
+  // std::string id;
+  // std::string type;
+  double x, y, z, confidence;
+  rclcpp::Time time;
+  Eigen::MatrixXd A{6, 6};
+  Eigen::MatrixXd B;
+  Eigen::MatrixXd C;
+  Eigen::MatrixXd Q;
+  Eigen::MatrixXd R;
+  double dT{30.0};
+  std::shared_ptr<state_observer::KalmanFilter> kf;
+  perception_system_interfaces::msg::Detection msg;
+  // leg_tracker_ros2::msg::LegArray leg_msg;
+  
+  HumanTracked(perception_system_interfaces::msg::Detection msg,
+               double dT, 
+               rclcpp::Time now) :                
+                time(now),
+                dT(dT)
+  {
+    A <<  1, 0, 0, dT, 0, 0,  // x
+          0, 1, 0, 0, dT, 0,  // y
+          0, 0, 1, 0, 0, dT,  // z
+          0, 0, 0, 1, 0, 0,  // x_dot
+          0, 0, 0, 0, 1, 0,  // y_dot
+          0, 0, 0, 0, 0, 1;  // z_dot
+    B = Eigen::MatrixXd::Zero(6, 1);
+    C = Eigen::MatrixXd::Zero(3, 6);
+    C.diagonal().setOnes();
+    Eigen::MatrixXd::Identity(6, 6);
+    Eigen::MatrixXd::Identity(3, 3);
+
+    Q = Eigen::MatrixXd::Identity(6, 6);
+    R = Eigen::MatrixXd::Identity(3, 3);
+
+    kf = std::make_shared<state_observer::KalmanFilter>(A, B, C, Q, R);
+    Eigen::VectorXd x0(6);
+    x = msg.center3d.position.x;
+    y = msg.center3d.position.y;
+    z = msg.center3d.position.z;
+    x0 << x, y, z, 0, 0, 0;
+    kf->initialize(x0);
+  }
+  void update(perception_system_interfaces::msg::Detection msg, rclcpp::Time now)
+  {
+    Eigen::VectorXd measurement(3);
+    measurement << msg.center3d.position.x, msg.center3d.position.y, msg.center3d.position.z;
+    kf->update(measurement);  
+    this->x = kf->get_output()(0);
+    this->y = kf->get_output()(1);
+    this->z = kf->get_output()(2);
+    this->msg.center3d.position.x = msg.center3d.position.x;
+    this->msg.center3d.position.y = msg.center3d.position.y;
+    this->msg.center3d.position.z = msg.center3d.position.z;
+    time = now;
+  }
+
 };
 
 class PerceptionListener
@@ -79,13 +152,21 @@ public:
       return a.center3d.position.z < b.center3d.position.z;
     });
 
+
 private:
   static std::shared_ptr<PerceptionListener> uniqueInstance_;
   std::shared_ptr<rclcpp_cascade_lifecycle::CascadeLifecycleNode> parent_node_;
 
   rclcpp::Subscription<perception_system_interfaces::msg::DetectionArray>::SharedPtr percept_sub_;
+  message_filters::Subscriber<leg_tracker_ros2::msg::LegArray,
+    rclcpp_lifecycle::LifecycleNode> leg_sub_;
+  message_filters::Subscriber<perception_system_interfaces::msg::DetectionArray,
+    rclcpp_lifecycle::LifecycleNode> detection_sub_;
+  std::shared_ptr<message_filters::Synchronizer<ApproximateSyncPolicy>> sync_;
+
   std::map<std::string, PerceptionInterest> interests_;
   std::map<std::string, PerceptionData> perceptions_;
+  std::map<std::string, HumanTracked> humans_;
 
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
@@ -94,7 +175,16 @@ private:
   perception_system_interfaces::msg::DetectionArray::UniquePtr last_msg_;
 
   void perception_callback(perception_system_interfaces::msg::DetectionArray::UniquePtr msg);
+  void sync_cb(
+    const perception_system_interfaces::msg::DetectionArray::ConstSharedPtr & detection_msg,
+    const leg_tracker_ros2::msg::LegArray::ConstSharedPtr & leg_msg);
+  void classical_update_(double hz = 30);
+  void update_with_yolo_(double hz = 30);
+  void initialize_filter_(
+    const geometry_msgs::msg::PointStamped & entity);
 
+  geometry_msgs::msg::PointStamped _update_filter(
+    const geometry_msgs::msg::PointStamped & entity);
 
   double max_time_perception_;
   double max_time_interest_;
@@ -102,6 +192,14 @@ private:
 
   std::string tf_frame_camera_;
   std::string tf_frame_map_;
+  bool use_people_filter_, use_multiple_sources_filter_;
+  std::string source_topic_;
+
+  std::shared_ptr<state_observer::KalmanFilter> kf_;
+
+  double lambda_, dT_{30.0};
+  bool state_obs_initialized_ = false;
+  bool update_dt_ = false;
 };
 
 }  // namespace perception_system
